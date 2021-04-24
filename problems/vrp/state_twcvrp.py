@@ -3,10 +3,13 @@ from typing import NamedTuple
 from utils.boolmask import mask_long2bool, mask_long_scatter
 
 
-class StateCVRP(NamedTuple):
+class StateTWCVRP(NamedTuple):
     # Fixed input
     coords: torch.Tensor  # Depot + loc
     demand: torch.Tensor
+    start_time: torch.Tensor
+    end_time: torch.Tensor
+    
 
     # If this state contains multiple copies (i.e. beam search) for the same instance, then for memory efficiency
     # the coords and demands tensors are not kept multiple times, so we need to use the ids to index the correct rows.
@@ -19,6 +22,7 @@ class StateCVRP(NamedTuple):
     lengths: torch.Tensor
     cur_coord: torch.Tensor
     i: torch.Tensor  # Keeps track of step
+    time: torch.Tensor # For time windows. Keep track of time.
 
     VEHICLE_CAPACITY = 1.0  # Hardcoded
 
@@ -34,6 +38,9 @@ class StateCVRP(NamedTuple):
         return (self.coords[:, :, None, :] - self.coords[:, None, :, :]).norm(p=2, dim=-1)
 
     def __getitem__(self, key):
+        key = torch.tensor(key)
+        print(key)
+        print(self.ids[key])
         assert torch.is_tensor(key) or isinstance(key, slice)  # If tensor, idx all tensors by this tensor:
         return self._replace(
             ids=self.ids[key],
@@ -41,6 +48,7 @@ class StateCVRP(NamedTuple):
             used_capacity=self.used_capacity[key],
             visited_=self.visited_[key],
             lengths=self.lengths[key],
+            time= self.time[key],
             cur_coord=self.cur_coord[key],
         )
 
@@ -54,11 +62,16 @@ class StateCVRP(NamedTuple):
         depot = input['depot']
         loc = input['loc']
         demand = input['demand']
+        start_time = input['start_time']
+        end_time = input['end_time']
+
 
         batch_size, n_loc, _ = loc.size()
-        return StateCVRP(
+        return StateTWCVRP(
             coords=torch.cat((depot[:, None, :], loc), -2),
             demand=demand,
+            start_time = start_time,
+            end_time = end_time,
             ids=torch.arange(batch_size, dtype=torch.int64, device=loc.device)[:, None],  # Add steps dimension
             prev_a=torch.zeros(batch_size, 1, dtype=torch.long, device=loc.device),
             used_capacity=demand.new_zeros(batch_size, 1),
@@ -72,6 +85,7 @@ class StateCVRP(NamedTuple):
                 else torch.zeros(batch_size, 1, (n_loc + 63) // 64, dtype=torch.int64, device=loc.device)  # Ceil
             ),
             lengths=torch.zeros(batch_size, 1, device=loc.device),
+            time=torch.zeros(batch_size, 1, device=loc.device),
             cur_coord=input['depot'][:, None, :],  # Add step dimension
             i=torch.zeros(1, dtype=torch.int64, device=loc.device)  # Vector with length num_steps
         )
@@ -93,20 +107,31 @@ class StateCVRP(NamedTuple):
 
         # Add the length
         cur_coord = self.coords[self.ids, selected]
-        # cur_coord = self.coords.gather(
-        #     1,
-        #     selected[:, None].expand(selected.size(0), 1, self.coords.size(-1))
-        # )[:, 0, :]
-        lengths = self.lengths + (cur_coord - self.cur_coord).norm(p=2, dim=-1)  # (batch_dim, 1)
+        distance = (cur_coord - self.cur_coord).norm(p=2, dim=-1)
+        
+
+    
+        
 
         # Not selected_demand is demand of first node (by clamp) so incorrect for nodes that visit depot!
-        #selected_demand = self.demand.gather(-1, torch.clamp(prev_a - 1, 0, n_loc - 1))
-        selected_demand = self.demand[self.ids, torch.clamp(prev_a - 1, 0, n_loc - 1)]
+        selected_demand = self.demand[self.ids, torch.clamp(prev_a - 1, 0, n_loc - 1)] * (distance != 0).float()
 
+
+        # Increase lengths if depot is not visited, and the vehicle has used capacity otherwise set to 0.
+        wait_time = torch.gather(torch.cat((torch.zeros(distance.shape[0],1,device = distance.device),self.start_time),dim = 1), 1,selected) - self.lengths
+        wait_time = torch.where(wait_time >= 0, wait_time, torch.zeros(wait_time.shape,device = distance.device))
+        
+        
+        lengths = (self.lengths + distance + wait_time) 
+        
+        # Extra time until open for next node. 
+        time = (self.time + distance + wait_time)*(prev_a != 0).float() 
+        
         # Increase capacity if depot is not visited, otherwise set to 0
         #used_capacity = torch.where(selected == 0, 0, self.used_capacity + selected_demand)
         used_capacity = (self.used_capacity + selected_demand) * (prev_a != 0).float()
-
+        
+    
         if self.visited_.dtype == torch.uint8:
             # Note: here we do not subtract one as we have to scatter so the first column allows scattering depot
             # Add one dimension since we write a single value
@@ -117,12 +142,12 @@ class StateCVRP(NamedTuple):
 
         return self._replace(
             prev_a=prev_a, used_capacity=used_capacity, visited_=visited_,
-            lengths=lengths, cur_coord=cur_coord, i=self.i + 1
+            lengths=lengths, cur_coord=cur_coord, i=self.i + 1,
+            time = time
         )
 
     def all_finished(self):
-        return self.i.item() >= self.demand.size(-1) and self.visited.all()
-
+        return (self.i.item() >= self.demand.size(-1) and self.visited.all()) 
     def get_finished(self):
         return self.visited.sum(-1) == self.visited.size(-1)
 
@@ -144,12 +169,21 @@ class StateCVRP(NamedTuple):
 
         # For demand steps_dim is inserted by indexing with id, for used_capacity insert node dim for broadcasting
         exceeds_cap = (self.demand[self.ids, :] + self.used_capacity[:, :, None] > self.VEHICLE_CAPACITY)
+        
+           
+        # Do not allow visits to stores that will be closed by the time that the vehicle arrives. 
+        distance = (self.coords - self.cur_coord).norm(p=2, dim=-1)
+        time_constraint = (self.end_time[self.ids,:] < (self.time[:,:,None].repeat(1,1,exceeds_cap.shape[2]) + distance[:,1:].reshape(exceeds_cap.shape[0],1,exceeds_cap.shape[2])))
         # Nodes that cannot be visited are already visited or too much demand to be served now
-        mask_loc = visited_loc.to(exceeds_cap.dtype) | exceeds_cap
-
+        mask_loc =  exceeds_cap | time_constraint | visited_loc.to(exceeds_cap.dtype)
+        
+        # Allow current location to be visited again.
+        
         # Cannot visit the depot if just visited and still unserved nodes
         mask_depot = (self.prev_a == 0) & ((mask_loc == 0).int().sum(-1) > 0)
-        return torch.cat((mask_depot[:, :, None], mask_loc), -1)
+        final = torch.cat((mask_depot[:, :, None], mask_loc), -1)
+    
+        return final
 
     def construct_solutions(self, actions):
         return actions

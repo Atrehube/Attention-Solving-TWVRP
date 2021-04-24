@@ -3,10 +3,12 @@ from typing import NamedTuple
 from utils.boolmask import mask_long2bool, mask_long_scatter
 
 
-class StateVRP(NamedTuple):
+class StateTWVRP(NamedTuple):
     # Fixed input
     loc: torch.Tensor
     coords: torch.Tensor  # Depot + loc
+    start_time: torch.Tensor
+    end_time: torch.Tensor
 
     # If this state contains multiple copies (i.e. beam search) for the same instance, then for memory efficiency
     # the coords and demands tensors are not kept multiple times, so we need to use the ids to index the correct rows.
@@ -18,7 +20,8 @@ class StateVRP(NamedTuple):
     lengths: torch.Tensor
     cur_coord: torch.Tensor
     i: torch.Tensor  # Keeps track of step
-
+    time: torch.Tensor # For time windows. Keep track of time.
+    
     @property
     def visited(self):
         if self.visited_.dtype == torch.uint8:
@@ -37,6 +40,7 @@ class StateVRP(NamedTuple):
             prev_a=self.prev_a[key],
             visited_=self.visited_[key],
             lengths=self.lengths[key],
+            time= self.time[key],
             cur_coord=self.cur_coord[key],
         )
 
@@ -48,11 +52,15 @@ class StateVRP(NamedTuple):
     def initialize(input, visited_dtype=torch.uint8):
         depot = input['depot']
         loc = input['loc']
+        start_time = input['start_time']
+        end_time = input['end_time']
 
         batch_size, n_loc, _ = loc.size()
-        return StateVRP(
+        return StateTWVRP(
             loc = loc,
             coords=torch.cat((depot[:, None, :], loc), -2),
+            start_time = start_time,
+            end_time = end_time,
             ids=torch.arange(batch_size, dtype=torch.int64, device=loc.device)[:, None],  # Add steps dimension
             prev_a=torch.zeros(batch_size, 1, dtype=torch.long, device=loc.device),
             visited_=(  # Visited as mask is easier to understand, as long more memory efficient
@@ -65,6 +73,7 @@ class StateVRP(NamedTuple):
                 else torch.zeros(batch_size, 1, (n_loc + 63) // 64, dtype=torch.int64, device=loc.device)  # Ceil
             ),
             lengths=torch.zeros(batch_size, 1, device=loc.device),
+            time=torch.zeros(batch_size, 1, device=loc.device),
             cur_coord=input['depot'][:, None, :],  # Add step dimension
             i=torch.zeros(1, dtype=torch.int64, device=loc.device)  # Vector with length num_steps
         )
@@ -85,10 +94,15 @@ class StateVRP(NamedTuple):
 
         # Add the length
         cur_coord = self.coords[self.ids, selected]
-        lengths = self.lengths + (cur_coord - self.cur_coord).norm(p=2, dim=-1)  # (batch_dim, 1)
+        distance = (cur_coord - self.cur_coord).norm(p=2, dim=-1)
 
-        # Not selected_demand is demand of first node (by clamp) so incorrect for nodes that visit depot!
-
+        wait_time = torch.gather(torch.cat((torch.zeros(distance.shape[0],1,device = distance.device),self.start_time),dim = 1), 1,selected) - self.lengths
+        wait_time = torch.where(wait_time >= 0, wait_time, torch.zeros(wait_time.shape,device = distance.device))
+        
+        lengths = self.lengths + distance + wait_time 
+        time = (self.time + distance + wait_time)*(prev_a != 0).float() 
+        
+        
         if self.visited_.dtype == torch.uint8:
             # Note: here we do not subtract one as we have to scatter so the first column allows scattering depot
             # Add one dimension since we write a single value
@@ -99,11 +113,12 @@ class StateVRP(NamedTuple):
 
         return self._replace(
             prev_a=prev_a, visited_=visited_,
-            lengths=lengths, cur_coord=cur_coord, i=self.i + 1
+            lengths=lengths, cur_coord=cur_coord, i=self.i + 1, time = time
         )
 
     def all_finished(self):
-        return self.i.item() >= self.loc.size(-1) and self.visited.all()
+        # Finished if time is ge than number of locations, and (all places visited, or current time is past time window)
+        return self.visited.all()
 
     def get_finished(self):
         return self.visited.sum(-1) == self.visited.size(-1)
@@ -124,13 +139,21 @@ class StateVRP(NamedTuple):
         else:
             visited_loc = mask_long2bool(self.visited_, n=self.loc.size(-1))
 
+        distance = (self.coords - self.cur_coord).norm(p=2, dim=-1)
+        time_constraint = (self.end_time[self.ids,:] < (self.time[:,:,None].repeat(1,1,visited_loc.shape[2]) + distance[:,1:].reshape(visited_loc.shape[0],1,visited_loc.shape[2])))
+        # Nodes that cannot be visited are already visited or too much demand to be served now
+        
+        mask_loc = visited_loc  | time_constraint
+
         # For demand steps_dim is inserted by indexing with id, for used_capacity insert node dim for broadcasting
         #exceeds_cap = (self.demand[self.ids, :] + self.used_capacity[:, :, None] > self.VEHICLE_CAPACITY)
         # Nodes that cannot be visited are already visited or too much demand to be served now
 
         # Cannot visit the depot if just visited and still unserved nodes
-        mask_depot = (self.prev_a == 0) & ((visited_loc == 0).int().sum(-1) > 0)
-        return torch.cat((mask_depot[:, :, None], visited_loc), -1)
+        mask_depot = (self.prev_a == 0) & ((mask_loc == 0).int().sum(-1) > 0)
+        return torch.cat((mask_depot[:, :, None], mask_loc), -1)
 
     def construct_solutions(self, actions):
         return actions
+# -*- coding: utf-8 -*-
+
