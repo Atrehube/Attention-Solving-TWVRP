@@ -18,7 +18,10 @@ from utils import torch_load_cpu, load_problem
 
 
 def run(opts):
-
+    # Overriding options is easier here. Remove this in the final version.
+    #opts = get_options(['--problem','twcvrp','--graph_size','20','--epoch_size','640000','--no_progress_bar','--baseline','rollout'])
+    opts = get_options(['--eval_only','--load_path','outputs/twcvrp_20/run_20210422T021640/epoch-99.pt','--problem','twcvrp','--graph_size','100','--epoch_size','500','--val_size','1000','--batch_size','500','--baseline','rollout','--n_epochs','20'])
+    #opts = get_options(['--problem','twcvrp','--no_cuda'])
     # Pretty print the run args
     pp.pprint(vars(opts))
 

@@ -17,6 +17,7 @@ def set_decode_type(model, decode_type):
     model.set_decode_type(decode_type)
 
 
+
 class AttentionModelFixed(NamedTuple):
     """
     Context for AttentionModel decoder that is fixed during decoding so can be precomputed/cached
@@ -61,7 +62,9 @@ class AttentionModel(nn.Module):
         self.decode_type = None
         self.temp = 1.0
         self.allow_partial = problem.NAME == 'sdvrp'
-        self.is_vrp = problem.NAME == 'cvrp' or problem.NAME == 'sdvrp'
+        self.is_vrp = problem.NAME == 'cvrp' or problem.NAME == 'sdvrp' or problem.NAME == 'vrp' or problem.NAME == 'twvrp' or problem.NAME == 'twcvrp'
+        self.is_cap = problem.NAME == 'cvrp' or problem.NAME == 'sdvrp' 
+        self.is_time_window = problem.NAME == 'twvrp' or problem.NAME == 'twcvrp'
         self.is_orienteering = problem.NAME == 'op'
         self.is_pctsp = problem.NAME == 'pctsp'
 
@@ -82,6 +85,8 @@ class AttentionModel(nn.Module):
 
             if self.is_pctsp:
                 node_dim = 4  # x, y, expected_prize, penalty
+            elif self.is_time_window:
+                node_dim = 5 # x,y,demand, time_window_start, time_window_end
             else:
                 node_dim = 3  # x, y, demand / prize
 
@@ -201,8 +206,11 @@ class AttentionModel(nn.Module):
     def _init_embed(self, input):
 
         if self.is_vrp or self.is_orienteering or self.is_pctsp:
-            if self.is_vrp:
-                features = ('demand', )
+
+            if self.is_vrp and self.is_time_window:
+                features = ('demand', 'start_time','end_time')
+            elif self.is_vrp:
+                features = ('demand',)
             elif self.is_orienteering:
                 features = ('prize', )
             else:
@@ -356,7 +364,6 @@ class AttentionModel(nn.Module):
 
         # Compute logits (unnormalized log_p)
         log_p, glimpse = self._one_to_many_logits(query, glimpse_K, glimpse_V, logit_K, mask)
-
         if normalize:
             log_p = torch.log_softmax(log_p / self.temp, dim=-1)
 
@@ -379,31 +386,60 @@ class AttentionModel(nn.Module):
 
         if self.is_vrp:
             # Embedding of previous node + remaining capacity
-            if from_depot:
-                # 1st dimension is node idx, but we do not squeeze it since we want to insert step dimension
-                # i.e. we actually want embeddings[:, 0, :][:, None, :] which is equivalent
-                return torch.cat(
-                    (
-                        embeddings[:, 0:1, :].expand(batch_size, num_steps, embeddings.size(-1)),
-                        # used capacity is 0 after visiting depot
-                        self.problem.VEHICLE_CAPACITY - torch.zeros_like(state.used_capacity[:, :, None])
-                    ),
-                    -1
-                )
+            if self.is_cap:
+                # embeddings of previous node
+                if from_depot:
+                    # 1st dimension is node idx, but we do not squeeze it since we want to insert step dimension
+                    # i.e. we actually want embeddings[:, 0, :][:, None, :] which is equivalent
+                    return torch.cat(
+                        (
+                            embeddings[:, 0:1, :].expand(batch_size, num_steps, embeddings.size(-1)),
+                            # used capacity is 0 after visiting depot
+                            self.problem.VEHICLE_CAPACITY - torch.zeros_like(state.used_capacity[:, :, None])
+                        ),
+                        -1
+                    )
+                else:
+                    return torch.cat(
+                        (
+                            torch.gather(
+                                embeddings,
+                                1,
+                                current_node.contiguous()
+                                    .view(batch_size, num_steps, 1)
+                                    .expand(batch_size, num_steps, embeddings.size(-1))
+                            ).view(batch_size, num_steps, embeddings.size(-1)),
+                            self.problem.VEHICLE_CAPACITY - state.used_capacity[:, :, None]
+                        ),
+                        -1
+                    )
             else:
-                return torch.cat(
-                    (
-                        torch.gather(
-                            embeddings,
-                            1,
-                            current_node.contiguous()
-                                .view(batch_size, num_steps, 1)
-                                .expand(batch_size, num_steps, embeddings.size(-1))
-                        ).view(batch_size, num_steps, embeddings.size(-1)),
-                        self.problem.VEHICLE_CAPACITY - state.used_capacity[:, :, None]
-                    ),
-                    -1
-                )
+                if from_depot:
+                    # 1st dimension is node idx, but we do not squeeze it since we want to insert step dimension
+                    # i.e. we actually want embeddings[:, 0, :][:, None, :] which is equivalent
+                    return torch.cat(
+                        (
+                            embeddings[:, 0:1, :].expand(batch_size, num_steps, embeddings.size(-1)),
+                            # used capacity is 0 after visiting depot
+                            torch.ones([batch_size,1,1],device = embeddings.device)
+                        ),
+                        -1
+                    )
+                else:
+                    return torch.cat(
+                        (
+                            torch.gather(
+                                embeddings,
+                                1,
+                                current_node.contiguous()
+                                    .view(batch_size, num_steps, 1)
+                                    .expand(batch_size, num_steps, embeddings.size(-1))
+                            ).view(batch_size, num_steps, embeddings.size(-1)),
+                            torch.ones([batch_size,1,1],device = embeddings.device)
+                        ),
+                        -1
+                    )
+ 
         elif self.is_orienteering or self.is_pctsp:
             return torch.cat(
                 (

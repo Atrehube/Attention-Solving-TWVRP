@@ -3,14 +3,15 @@ import time
 from tqdm import tqdm
 import torch
 import math
-
+import numpy as np
 from torch.utils.data import DataLoader
 from torch.nn import DataParallel
 
 from nets.attention_model import set_decode_type
 from utils.log_utils import log_values
 from utils import move_to
-
+from or_tools import or_tools_twvrp
+from datetime import datetime
 
 def get_inner_model(model):
     return model.module if isinstance(model, DataParallel) else model
@@ -19,11 +20,20 @@ def get_inner_model(model):
 def validate(model, dataset, opts):
     # Validate
     print('Validating...')
+    start = datetime.now()
     cost = rollout(model, dataset, opts)
+    end = datetime.now()
     avg_cost = cost.mean()
     print('Validation overall avg_cost: {} +- {}'.format(
         avg_cost, torch.std(cost) / math.sqrt(len(cost))))
-
+    if opts.eval_only:
+        print('Average time for AM predictions:', ((end - start)/len(cost)).microseconds, 'microseconds')
+        start = datetime.now()
+        costs = or_tools_twvrp(dataset,opts)
+        end = datetime.now()
+        print('OR-Tools average cost: {} += {}'.format(
+            np.array(costs).mean(), np.array(costs).std() / math.sqrt(len(costs))))
+        print('OR-Tools average time: ', ((end - start)/len(cost)).microseconds,'microseconds')
     return avg_cost
 
 
