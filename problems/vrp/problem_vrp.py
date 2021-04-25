@@ -11,7 +11,10 @@ from problems.vrp.state_twcvrp import StateTWCVRP
 from utils.beam_search import beam_search
 
 class VRP(object):
-    NAME = 'vrp' # Vehicle Routing Problem
+    NAME = 'cvrp'  # Capacitated Vehicle Routing Problem
+
+    VEHICLE_CAPACITY = 1.0  # (w.l.o.g. vehicle capacity is 1, demands should be scaled)
+
     @staticmethod
     def get_costs(dataset, pi):
         batch_size, graph_size = dataset['demand'].size()
@@ -23,7 +26,8 @@ class VRP(object):
             torch.arange(1, graph_size + 1, out=pi.data.new()).view(1, -1).expand(batch_size, graph_size) ==
             sorted_pi[:, -graph_size:]
         ).all() and (sorted_pi[:, :-graph_size] == 0).all(), "Invalid tour"
-        
+
+        # Visiting depot resets capacity so we add demand = -capacity (we make sure it does not become negative)
         demand_with_depot = torch.cat(
             (
                 torch.full_like(dataset['demand'][:, :1], -CVRP.VEHICLE_CAPACITY),
@@ -32,6 +36,13 @@ class VRP(object):
             1
         )
         d = demand_with_depot.gather(1, pi)
+
+        used_cap = torch.zeros_like(dataset['demand'][:, 0])
+        for i in range(pi.size(1)):
+            used_cap += d[:, i]  # This will reset/make capacity negative if i == 0, e.g. depot visited
+            # Cannot use less than 0
+            used_cap[used_cap < 0] = 0
+            assert (used_cap <= CVRP.VEHICLE_CAPACITY + 1e-5).all(), "Used more than capacity"
 
         # Gather dataset in order of tour
         loc_with_depot = torch.cat((dataset['depot'][:, None, :], dataset['loc']), 1)
@@ -43,14 +54,14 @@ class VRP(object):
             + (d[:, 0] - dataset['depot']).norm(p=2, dim=1)  # Depot to first
             + (d[:, -1] - dataset['depot']).norm(p=2, dim=1)  # Last to depot, will be 0 if depot is last
         ), None
-        
+
     @staticmethod
     def make_dataset(*args, **kwargs):
-        return VRPDataset(*args, **kwargs) # Could define a new dataset method w/o demands/caps to improve efficiency.
+        return VRPDataset(*args, **kwargs)
 
     @staticmethod
     def make_state(*args, **kwargs):
-        return StateVRP.initialize(*args, **kwargs)
+        return StateCVRP.initialize(*args, **kwargs)
 
     @staticmethod
     def beam_search(input, beam_size, expand_size=None,
@@ -65,7 +76,7 @@ class VRP(object):
                 beam, fixed, expand_size, normalize=True, max_calc_batch_size=max_calc_batch_size
             )
 
-        state = VRP.make_state(
+        state = CVRP.make_state(
             input, visited_dtype=torch.int64 if compress_mask else torch.uint8
         )
 
