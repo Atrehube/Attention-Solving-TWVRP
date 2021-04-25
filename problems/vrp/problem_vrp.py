@@ -146,7 +146,7 @@ class CVRP(object):
 
 
 class TWVRP(object):
-    NAME = 'vrp' # Vehicle Routing Problem
+    NAME = 'twvrp' # Vehicle Routing Problem
     @staticmethod
     def get_costs(dataset, pi):
         batch_size, graph_size = dataset['demand'].size()
@@ -158,26 +158,56 @@ class TWVRP(object):
             torch.arange(1, graph_size + 1, out=pi.data.new()).view(1, -1).expand(batch_size, graph_size) ==
             sorted_pi[:, -graph_size:]
         ).all() and (sorted_pi[:, :-graph_size] == 0).all(), "Invalid tour"
-        
-        demand_with_depot = torch.cat(
-            (
-                torch.full_like(dataset['demand'][:, :1], -CVRP.VEHICLE_CAPACITY),
-                dataset['demand']
-            ),
-            1
-        )
-        d = demand_with_depot.gather(1, pi)
+
 
         # Gather dataset in order of tour
         loc_with_depot = torch.cat((dataset['depot'][:, None, :], dataset['loc']), 1)
         d = loc_with_depot.gather(1, pi[..., None].expand(*pi.size(), loc_with_depot.size(-1)))
 
         # Length is distance (L2-norm of difference) of each next location to its prev and of first and last to depot
+        # collect the number of missed locations per trial
+        
+        # Reconstruct waiting times.
+        
+        times_with_depot = torch.cat(
+            (
+            torch.full_like(dataset['start_time'][:,:1], 0),
+            dataset['start_time']
+            ),
+            1
+        )
+        
+        # Get the start times, arange according to policy
+        start_times = times_with_depot.gather(1,pi)
+
+       
+        # Find the travel times in distance
+        travel_times = (d[:, 1:] - d[:, :-1]).norm(p=2, dim=2)
+        # Add a 0 to the end of travel time so the dimensions match
+        travel_times = torch.cat((travel_times, torch.zeros(travel_times.shape[0],1,device = travel_times.device)),dim =1)
+        travel_times_master = torch.clone(travel_times)
+        
+        for step in range(pi.shape[1]):
+            # each cost is the maximum of the previous cost + change , or time window.
+            # get previous travel time
+            prev = torch.cat((torch.zeros((travel_times.shape[0],1),device = travel_times.device),travel_times[:,:-1]),dim = 1)
+            # current step is the maximum of ( previous cost + travel_time, or time window bound )
+            travel_times[:,step] = torch.max(start_times[:,step],travel_times[:,step] + prev[:,step])
+            # Reset the cum sum at each depot. 
+            travel_times = torch.where(pi == 0, travel_times_master,travel_times)
+        
+        # Get the marginal change in travel time. Mimicks original travel_times but now has jumps for waiting. 
+        marginal = (travel_times[:, 1:] - travel_times[:, :-1])
+        marginal = torch.cat((torch.zeros((marginal.shape[0],1),device = travel_times.device),marginal),dim = 1)
+        # When returning to the depot, overwrite with orginal distance to return to depot. 
+        marginal = torch.where(pi == 0, travel_times_master,marginal)
+                          
         return (
-            (d[:, 1:] - d[:, :-1]).norm(p=2, dim=2).sum(1)
+            marginal.sum(1)
             + (d[:, 0] - dataset['depot']).norm(p=2, dim=1)  # Depot to first
-            + (d[:, -1] - dataset['depot']).norm(p=2, dim=1)  # Last to depot, will be 0 if depot is last
+            + (d[:, -1] - dataset['depot']).norm(p=2, dim=1)  # Last to depot, will be 0 if depot is last 
         ), None
+    
         
     @staticmethod
     def make_dataset(*args, **kwargs):
@@ -185,7 +215,7 @@ class TWVRP(object):
 
     @staticmethod
     def make_state(*args, **kwargs):
-        return StateVRP.initialize(*args, **kwargs)
+        return StateTWVRP.initialize(*args, **kwargs)
 
     @staticmethod
     def beam_search(input, beam_size, expand_size=None,
@@ -200,7 +230,7 @@ class TWVRP(object):
                 beam, fixed, expand_size, normalize=True, max_calc_batch_size=max_calc_batch_size
             )
 
-        state = VRP.make_state(
+        state = TWVRP.make_state(
             input, visited_dtype=torch.int64 if compress_mask else torch.uint8
         )
 
@@ -208,8 +238,7 @@ class TWVRP(object):
 
 class TWCVRP(object):
 
-
-    NAME = 'cvrp'  # Capacitated Vehicle Routing Problem
+    NAME = 'twcvrp'  # Capacitated Vehicle Routing Problem
 
     VEHICLE_CAPACITY = 1.0  # (w.l.o.g. vehicle capacity is 1, demands should be scaled)
 
@@ -224,7 +253,6 @@ class TWCVRP(object):
             torch.arange(1, graph_size + 1, out=pi.data.new()).view(1, -1).expand(batch_size, graph_size) ==
             sorted_pi[:, -graph_size:]
         ).all() and (sorted_pi[:, :-graph_size] == 0).all(), "Invalid tour"
-
         # Visiting depot resets capacity so we add demand = -capacity (we make sure it does not become negative)
         demand_with_depot = torch.cat(
             (
@@ -242,15 +270,85 @@ class TWCVRP(object):
             used_cap[used_cap < 0] = 0
             assert (used_cap <= CVRP.VEHICLE_CAPACITY + 1e-5).all(), "Used more than capacity"
 
+
+
         # Gather dataset in order of tour
         loc_with_depot = torch.cat((dataset['depot'][:, None, :], dataset['loc']), 1)
         d = loc_with_depot.gather(1, pi[..., None].expand(*pi.size(), loc_with_depot.size(-1)))
 
-        # Length is distance (L2-norm of difference) of each next location to its prev and of first and last to depot
+
+            # Reconstruct waiting times.
+        
+        times_with_depot = torch.cat(
+            (
+            torch.full_like(dataset['start_time'][:,:1], 0),
+            dataset['start_time']
+            ),
+            1
+        )
+        
+        # Get the start times, arange according to policy
+        #start_times = times_with_depot.gather(1,pi)
+        
+        #for _ in range(pi.shape[1]):
+        #    forward_fill = torch.cat((torch.zeros((start_times.shape[0],1),device = start_times.device),start_times[:,:-1]),dim = 1)
+        #    start_times = torch.where(torch.logical_and(start_times < forward_fill, start_times != 0), forward_fill, start_times)
+
+        # Find the extra waiting times
+        #excess = torch.where(start_times != 0 , (start_times - torch.cat((torch.zeros((start_times.shape[0],1),device = start_times.device),start_times[:,:-1]),dim = 1)),start_times)
+
+        
+        # Get the start times, arange according to policy
+        start_times = times_with_depot.gather(1,pi)
+
+        travel_times = (d[:, 1:] - d[:, :-1]).norm(p=2, dim=2)
+        # Add a 0 to the end of travel time so the dimensions match
+        travel_times = torch.cat((travel_times, torch.zeros(travel_times.shape[0],1,device = travel_times.device)),dim =1)
+        travel_times_master = torch.clone(travel_times)
+        
+        for step in range(pi.shape[1]):
+            # each cost is the maximum of the previous cost + change , or time window.
+            # get previous travel time
+            prev = torch.cat((torch.zeros((travel_times.shape[0],1),device = travel_times.device),travel_times[:,:-1]),dim = 1)
+            # current step is the maximum of ( previous cost + travel_time, or time window bound )
+            travel_times[:,step] = torch.max(start_times[:,step],travel_times[:,step] + prev[:,step])
+            # Reset the cum sum at each depot. 
+            travel_times = torch.where(pi == 0, travel_times_master,travel_times)
+        
+        # Get the marginal change in travel time. Mimicks original travel_times but now has jumps for waiting. 
+        marginal = (travel_times[:, 1:] - travel_times[:, :-1])
+        marginal = torch.cat((torch.zeros((marginal.shape[0],1),device = travel_times.device),marginal),dim = 1)
+        # When returning to the depot, overwrite with orginal distance to return to depot. 
+        marginal = torch.where(pi == 0, travel_times_master,marginal)
+
+
+        # Get the start times, arange according to policy
+        #start_times = times_with_depot.gather(1,pi)
+        # Find the travel times in distance
+        #travel_times = (d[:, 1:] - d[:, :-1]).norm(p=2, dim=2)
+        # Add a 0 to the end of travel time so the dimensions match
+        #travel_times = torch.cat((travel_times, torch.zeros(travel_times.shape[0],1,device = travel_times.device)),dim =1)
+        # Create a tour length that resets to 0 when the depot is visitied again
+        #partials = torch.where(pi == 0, torch.zeros(*pi.size(),device = travel_times.device),travel_times)
+        # Find the cumulative value of this route.
+        #cumulative = partials.cumsum(dim = 1)
+        # Find where the routes, restart
+        #restart = torch.where(partials != 0,torch.zeros(*pi.size(),device = travel_times.device),cumulative)
+        # Propagate the 'reset' value forward. This is the trip length at the first stop.
+        # Loop through the lenght of policy to ensure that propagation completes.
+        #for _ in range(pi.shape[1]):
+        #    forward_fill = torch.cat((torch.zeros((restart.shape[0],1),device = restart.device),restart[:,:-1]),dim = 1)
+        #    restart = torch.where(restart == 0, restart + forward_fill, restart)
+        # The result is a cumulative length of each trip.
+        #results = cumulative - restart
+            
+        # The excess waiting time is equal to the maximum discrepancy in travel length compared to opening time.
+        #excess_waiting = torch.where(start_times - results > 0, start_times - results, torch.zeros(*pi.size(),device = pi.device)).max(dim = 1)[0]
+                                  
         return (
-            (d[:, 1:] - d[:, :-1]).norm(p=2, dim=2).sum(1)
+             marginal.sum(1)
             + (d[:, 0] - dataset['depot']).norm(p=2, dim=1)  # Depot to first
-            + (d[:, -1] - dataset['depot']).norm(p=2, dim=1)  # Last to depot, will be 0 if depot is last
+            + (d[:, -1] - dataset['depot']).norm(p=2, dim=1)  # Last to depot, will be 0 if depot is last 
         ), None
 
     @staticmethod
@@ -259,7 +357,7 @@ class TWCVRP(object):
 
     @staticmethod
     def make_state(*args, **kwargs):
-        return StateCVRP.initialize(*args, **kwargs)
+        return StateTWCVRP.initialize(*args, **kwargs)
 
     @staticmethod
     def beam_search(input, beam_size, expand_size=None,
@@ -274,12 +372,12 @@ class TWCVRP(object):
                 beam, fixed, expand_size, normalize=True, max_calc_batch_size=max_calc_batch_size
             )
 
-        state = CVRP.make_state(
+        state = TWCVRP.make_state(
             input, visited_dtype=torch.int64 if compress_mask else torch.uint8
         )
 
         return beam_search(state, beam_size, propose_expansions)
-    
+
 class SDVRP(object):
 
     NAME = 'sdvrp'  # Split Delivery Vehicle Routing Problem
